@@ -354,6 +354,205 @@ namespace winrt::TerminalApp::implementation
     }
 
     // Method Description:
+    // - Builds the flyout (dropdown) attached to the new tab button, and
+    //   attaches it to the button. Populates the flyout with one entry per
+    //   Profile, displaying the profile's name. Clicking each flyout item will
+    //   open a new tab with that profile.
+    //   Below the profiles are the static menu items: settings, feedback
+    void App::_CreateNewTabFlyout()
+    {
+        auto newTabFlyout = Controls::MenuFlyout{};
+        auto keyBindings = _settings->GetKeybindings();
+
+        const GUID defaultProfileGuid = _settings->GlobalSettings().GetDefaultProfile();
+        for (int profileIndex = 0; profileIndex < _settings->GetProfiles().size(); profileIndex++)
+        {
+            const auto& profile = _settings->GetProfiles()[profileIndex];
+            auto profileMenuItem = Controls::MenuFlyoutItem{};
+
+            // add the keyboard shortcuts for the first 9 profiles
+            if (profileIndex < 9)
+            {
+                // enum value for ShortcutAction::NewTabProfileX; 0==NewTabProfile0
+                auto profileKeyChord = keyBindings.GetKeyBinding(static_cast<ShortcutAction>(profileIndex + static_cast<int>(ShortcutAction::NewTabProfile0)));
+
+                // make sure we find one to display
+                if (profileKeyChord)
+                {
+                    _SetAcceleratorForMenuItem(profileMenuItem, profileKeyChord);
+                }
+            }
+
+            auto profileName = profile.GetName();
+            winrt::hstring hName{ profileName };
+            profileMenuItem.Text(hName);
+
+            // If there's an icon set for this profile, set it as the icon for
+            // this flyout item.
+            if (profile.HasIcon())
+            {
+                profileMenuItem.Icon(_GetIconFromProfile(profile));
+            }
+
+            if (profile.GetGuid() == defaultProfileGuid)
+            {
+                // Contrast the default profile with others in font weight.
+                profileMenuItem.FontWeight(FontWeights::Bold());
+            }
+
+            profileMenuItem.Click([this, profileIndex](auto&&, auto&&) {
+                this->_OpenNewTab({ profileIndex });
+            });
+            newTabFlyout.Items().Append(profileMenuItem);
+        }
+
+        // add menu separator
+        auto separatorItem = Controls::MenuFlyoutSeparator{};
+        newTabFlyout.Items().Append(separatorItem);
+
+        // add static items
+        {
+            // Create the settings button.
+            auto settingsItem = Controls::MenuFlyoutItem{};
+            settingsItem.Text(L"Settings");
+
+            Controls::SymbolIcon ico{};
+            ico.Symbol(Controls::Symbol::Setting);
+            settingsItem.Icon(ico);
+
+            settingsItem.Click({ this, &App::_SettingsButtonOnClick });
+            newTabFlyout.Items().Append(settingsItem);
+
+            auto settingsKeyChord = keyBindings.GetKeyBinding(ShortcutAction::OpenSettings);
+            if (settingsKeyChord)
+            {
+                _SetAcceleratorForMenuItem(settingsItem, settingsKeyChord);
+            }
+
+            // Create the feedback button.
+            auto feedbackFlyout = Controls::MenuFlyoutItem{};
+            feedbackFlyout.Text(L"Feedback");
+
+            Controls::FontIcon feedbackIco{};
+            feedbackIco.Glyph(L"\xE939");
+            feedbackIco.FontFamily(Media::FontFamily{ L"Segoe MDL2 Assets" });
+            feedbackFlyout.Icon(feedbackIco);
+
+            feedbackFlyout.Click({ this, &App::_FeedbackButtonOnClick });
+            newTabFlyout.Items().Append(feedbackFlyout);
+
+            // Create the snippets flyout
+
+            auto snippetsFlyout = Controls::MenuFlyoutItem{};
+            snippetsFlyout.Text(L"Snippets");
+            newTabFlyout.Items().Append(snippetsFlyout);
+
+            // Create the about button.
+            auto aboutFlyout = Controls::MenuFlyoutItem{};
+            aboutFlyout.Text(L"About");
+
+            Controls::SymbolIcon aboutIco{};
+            aboutIco.Symbol(Controls::Symbol::Help);
+            aboutFlyout.Icon(aboutIco);
+
+            aboutFlyout.Click({ this, &App::_AboutButtonOnClick });
+            newTabFlyout.Items().Append(aboutFlyout);
+        }
+
+        _newTabButton.Flyout(newTabFlyout);
+    }
+
+    // Function Description:
+    // - Called when the settings button is clicked. ShellExecutes the settings
+    //   file, as to open it in the default editor for .json files. Does this in
+    //   a background thread, as to not hang/crash the UI thread.
+    fire_and_forget LaunchSettings()
+    {
+        // This will switch the execution of the function to a background (not
+        // UI) thread. This is IMPORTANT, because the Windows.Storage API's
+        // (used for retrieving the path to the file) will crash on the UI
+        // thread, because the main thread is a STA.
+        co_await winrt::resume_background();
+
+        const auto settingsPath = CascadiaSettings::GetSettingsPath();
+
+        HINSTANCE res = ShellExecute(nullptr, nullptr, settingsPath.c_str(), nullptr, nullptr, SW_SHOW);
+        if (static_cast<int>(reinterpret_cast<uintptr_t>(res)) <= 32)
+        {
+            ShellExecute(nullptr, nullptr, L"notepad", settingsPath.c_str(), nullptr, SW_SHOW);
+        }
+    }
+
+    // Method Description:
+    // - Called when the settings button is clicked. Launches a background
+    //   thread to open the settings file in the default JSON editor.
+    // Arguments:
+    // - <none>
+    // Return Value:
+    // - <none>
+    void App::_SettingsButtonOnClick(const IInspectable&,
+                                     const RoutedEventArgs&)
+    {
+        LaunchSettings();
+    }
+
+    // Method Description:
+    // - Called when the feedback button is clicked. Launches github in your
+    //   default browser, navigated to the "issues" page of the Terminal repo.
+    void App::_FeedbackButtonOnClick(const IInspectable&,
+                                     const RoutedEventArgs&)
+    {
+        const auto feedbackUriValue = Windows::ApplicationModel::Resources::ResourceLoader::GetForCurrentView().GetString(L"FeedbackUriValue");
+
+        winrt::Windows::System::Launcher::LaunchUriAsync({ feedbackUriValue });
+    }
+
+    // Method Description:
+    // - Called when the about button is clicked. See _ShowAboutDialog for more info.
+    // Arguments:
+    // - <unused>
+    // Return Value:
+    // - <none>
+    void App::_AboutButtonOnClick(const IInspectable&,
+                                  const RoutedEventArgs&)
+    {
+        _ShowAboutDialog();
+    }
+
+    // Method Description:
+    // - Register our event handlers with the given keybindings object. This
+    //   should be done regardless of what the events are actually bound to -
+    //   this simply ensures the AppKeyBindings object will call us correctly
+    //   for each event.
+    // Arguments:
+    // - bindings: A AppKeyBindings object to wire up with our event handlers
+    void App::_HookupKeyBindings(TerminalApp::AppKeyBindings bindings) noexcept
+    {
+        // Hook up the KeyBinding object's events to our handlers.
+        // They should all be hooked up here, regardless of whether or not
+        //      there's an actual keychord for them.
+        bindings.NewTab([this]() { _OpenNewTab(std::nullopt); });
+        bindings.DuplicateTab([this]() { _DuplicateTabViewItem(); });
+        bindings.CloseTab([this]() { _CloseFocusedTab(); });
+        bindings.ClosePane([this]() { _CloseFocusedPane(); });
+        bindings.NewTabWithProfile([this](const auto index) { _OpenNewTab({ index }); });
+        bindings.ScrollUp([this]() { _Scroll(-1); });
+        bindings.ScrollDown([this]() { _Scroll(1); });
+        bindings.NextTab([this]() { _SelectNextTab(true); });
+        bindings.PrevTab([this]() { _SelectNextTab(false); });
+        bindings.SplitVertical([this]() { _SplitVertical(std::nullopt); });
+        bindings.SplitHorizontal([this]() { _SplitHorizontal(std::nullopt); });
+        bindings.ScrollUpPage([this]() { _ScrollPage(-1); });
+        bindings.ScrollDownPage([this]() { _ScrollPage(1); });
+        bindings.SwitchToTab([this](const auto index) { _SelectTab({ index }); });
+        bindings.OpenSettings([this]() { _OpenSettings(); });
+        bindings.ResizePane([this](const auto direction) { _ResizePane(direction); });
+        bindings.MoveFocus([this](const auto direction) { _MoveFocus(direction); });
+        bindings.CopyText([this](const auto trimWhitespace) { _CopyText(trimWhitespace); });
+        bindings.PasteText([this]() { _PasteText(); });
+    }
+
+    // Method Description:
     // - Attempt to load the settings. If we fail for any reason, returns an error.
     // Return Value:
     // - S_OK if we successfully parsed the settings, otherwise an appropriate HRESULT.
