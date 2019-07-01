@@ -442,9 +442,14 @@ namespace winrt::TerminalApp::implementation
             newTabFlyout.Items().Append(feedbackFlyout);
 
             // Create the snippets flyout
-
             auto snippetsFlyout = Controls::MenuFlyoutItem{};
             snippetsFlyout.Text(L"Snippets");
+
+            Controls::FontIcon snippetsIco{};
+            snippetsIco.Glyph(L"\xE8A4");
+            snippetsIco.FontFamily(Media::FontFamily{ L"Segoe MDL2 Assets" });
+            snippetsFlyout.Icon(snippetsIco);
+
             newTabFlyout.Items().Append(snippetsFlyout);
 
             // Create the about button.
