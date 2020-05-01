@@ -424,7 +424,7 @@ void CascadiaSettings::_LoadDynamicProfiles()
                 {
                     profile.Source(generatorNamespace);
 
-                    _allProfiles.Append(profile);
+                    _profilesAndGroups.emplace_back(profile);
                 }
             }
             CATCH_LOG_MSG("Dynamic Profile Namespace: \"%ls\"", generatorNamespace.data());
@@ -738,6 +738,33 @@ bool CascadiaSettings::_PrependSchemaDirective()
     return true;
 }
 
+const bool CascadiaSettings::_IsInJsonJsonObject(const Profile& profile, const Json::Value& json)
+{
+    for (auto profileJson : json)
+    {
+        if (profileJson.isObject())
+        {
+            auto profilesList = profileJson[JsonKey(ProfilesListKey)];
+            if (profilesList.isArray())
+            {
+                auto found = _IsInJsonJsonObject(profile, profilesList);
+                if (found)
+                {
+                    return true;
+                }
+            }
+            else if (profile.ShouldBeLayered(profileJson))
+            {
+                return true;
+            }
+            // If the profileJson doesn't have a GUID, then it might be in
+            // the file still. We returned false because it shouldn't be
+            // layered, but it might be a name-only profile.
+        }
+    }
+    return false;
+}
+
 // Method Description:
 // - Finds all the dynamic profiles we've generated that _don't_ exist in the
 //   user's settings. Generates a minimal blob of json for them, and inserts
@@ -768,24 +795,6 @@ bool CascadiaSettings::_AppendDynamicProfilesToUserSettings()
     wbuilder.settings_["indentation"] = "    ";
     wbuilder.settings_["enableYAMLCompatibility"] = true; // suppress spaces around colons
 
-    auto isInJsonObj = [](const auto& profile, const auto& json) {
-        for (auto profileJson : _GetProfilesJsonObject(json))
-        {
-            if (profileJson.isObject())
-            {
-                const auto profileImpl = winrt::get_self<implementation::Profile>(profile);
-                if (profileImpl->ShouldBeLayered(profileJson))
-                {
-                    return true;
-                }
-                // If the profileJson doesn't have a GUID, then it might be in
-                // the file still. We returned false because it shouldn't be
-                // layered, but it might be a name-only profile.
-            }
-        }
-        return false;
-    };
-
     // Get the index in the user settings string of the _last_ profile.
     // We want to start inserting profiles immediately following the last profile.
     const auto userProfilesObj = _GetProfilesJsonObject(_userSettings);
@@ -800,10 +809,13 @@ bool CascadiaSettings::_AppendDynamicProfilesToUserSettings()
 
     bool changedFile = false;
 
-    for (const auto& profile : _allProfiles)
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
+
+    for (const auto& profile : profiles)
     {
         // Skip profiles that are in the user settings or the default settings.
-        if (isInJsonObj(profile, _userSettings) || isInJsonObj(profile, _defaultSettings))
+        if (_IsInJsonJsonObject(profile, _GetProfilesJsonObject(_userSettings)) || _IsInJsonJsonObject(profile, _GetProfilesJsonObject(_defaultSettings)))
         {
             continue;
         }
@@ -887,9 +899,20 @@ void CascadiaSettings::LayerJson(const Json::Value& json)
     {
         if (profileJson.isObject())
         {
-            _LayerOrCreateProfile(profileJson);
+            _LayerOrCreateProfile(_profilesAndGroups, profileJson, _userDefaultProfileSettings);
         }
     }
+}
+
+const Json::Value* CascadiaSettings::_GetProfileGroupProfilesList(const Json::Value& json)
+{
+    auto profilesList = json[JsonKey(ProfilesListKey)];
+    if (profilesList.isArray())
+    {
+        return &json[JsonKey(ProfilesListKey)];
+    }
+
+    return nullptr;
 }
 
 // Method Description:
@@ -904,50 +927,61 @@ void CascadiaSettings::LayerJson(const Json::Value& json)
 // - json: an object which may be a partial serialization of a Profile object.
 // Return Value:
 // - <none>
-void CascadiaSettings::_LayerOrCreateProfile(const Json::Value& profileJson)
+void CascadiaSettings::_LayerOrCreateProfile(std::vector<std::variant<Profile, ProfileGroup>>& profilesAndGroups, const Json::Value& profileJson, const Json::Value userDefaultProfileSettings)
 {
     // Layer the json on top of an existing profile, if we have one:
-    auto profileIndex{ _FindMatchingProfileIndex(profileJson) };
-    if (profileIndex)
+    auto pProfile = _FindMatchingProfile(profilesAndGroups, profileJson);
+    if (pProfile.has_value())
     {
-        auto parentProj{ _allProfiles.GetAt(*profileIndex) };
-        auto parent{ winrt::get_self<Profile>(parentProj) };
-
-        if (_userDefaultProfileSettings)
+        if (std::holds_alternative<Profile>(pProfile.value()))
         {
-            // We don't actually need to CreateChild() here.
-            // When we loaded Profile.Defaults, we created an empty child already.
-            // So this just populates the empty child
-            parent->LayerJson(profileJson);
+            std::get<Profile>(pProfile.value()).LayerJson(profileJson);
         }
-        else
+        else if (std::holds_alternative<ProfileGroup>(pProfile.value()))
         {
-            // otherwise, add a new inheritance layer
-            auto childImpl{ parent->CreateChild() };
-            childImpl->LayerJson(profileJson);
-
-            // replace parent in _profiles with child
-            _allProfiles.SetAt(*profileIndex, *childImpl);
+            std::get<ProfileGroup>(pProfile.value()).LayerJson(profileJson);
         }
     }
     else
     {
-        // If this JSON represents a dynamic profile, we _shouldn't_ create the
-        // profile here. We only want to create profiles for profiles without a
-        // `source`. Dynamic profiles _must_ be layered on an existing profile.
-        if (!Profile::IsDynamicProfileObject(profileJson))
+        auto profilesList = _GetProfileGroupProfilesList(profileJson);
+        if (profilesList != nullptr)
         {
-            auto profile{ winrt::make_self<Profile>() };
+            std::vector<std::variant<Profile, ProfileGroup>> innerProfilesAndGroups;
 
-            // GH#2325: If we have a set of default profile settings, set that as my parent.
-            // We _won't_ have these settings yet for defaults, dynamic profiles.
-            if (_userDefaultProfileSettings)
+            for (auto innerProfileJson : *profilesList)
             {
-                profile->InsertParent(0, _userDefaultProfileSettings);
+                if (innerProfileJson.isObject())
+                {
+                    _LayerOrCreateProfile(innerProfilesAndGroups, innerProfileJson, userDefaultProfileSettings);
+                }
             }
 
-            profile->LayerJson(profileJson);
-            _allProfiles.Append(*profile);
+            ProfileGroup profileGroup = ProfileGroup(innerProfilesAndGroups);
+
+            profileGroup.LayerJson(profileJson);
+            profilesAndGroups.emplace_back(profileGroup);
+        }
+        else
+        {
+            // If this JSON represents a dynamic profile, we _shouldn't_ create the
+            // profile here. We only want to create profiles for profiles without a
+            // `source`. Dynamic profiles _must_ be layered on an existing profile.
+            if (!Profile::IsDynamicProfileObject(profileJson))
+            {
+                Profile profile{};
+
+                // GH#2325: If we have a set of default profile settings, apply them here.
+                // We _won't_ have these settings yet for defaults, dynamic profiles.
+                if (userDefaultProfileSettings)
+                {
+                    profile.LayerJson(userDefaultProfileSettings);
+                }
+
+                profile.LayerJson(profileJson);
+                //_profiles.emplace_back(profile);
+                profilesAndGroups.emplace_back(profile);
+            }
         }
     }
 }
@@ -963,37 +997,26 @@ void CascadiaSettings::_LayerOrCreateProfile(const Json::Value& profileJson)
 // Return Value:
 // - a Profile that can be layered with the given json object, iff such a
 //   profile exists.
-winrt::com_ptr<Profile> CascadiaSettings::_FindMatchingProfile(const Json::Value& profileJson)
+std::optional<std::variant<Profile, ProfileGroup>> CascadiaSettings::_FindMatchingProfile(const std::vector<std::variant<Profile, ProfileGroup>>& profilesAndGroups, const Json::Value& profileJson)
 {
-    auto index{ _FindMatchingProfileIndex(profileJson) };
-    if (index)
+    for (auto& profileOrGroup : profilesAndGroups)
     {
-        auto profile{ _allProfiles.GetAt(*index) };
-        auto profileImpl{ winrt::get_self<Profile>(profile) };
-        return profileImpl->get_strong();
-    }
-    return nullptr;
-}
-
-// Method Description:
-// - Finds a profile from our list of profiles that matches the given json
-//   object. Uses Profile::ShouldBeLayered to determine if the Json::Value is a
-//   match or not. This method should be used to find a profile to layer the
-//   given settings upon.
-// - Returns nullopt if no such match exists.
-// Arguments:
-// - json: an object which may be a partial serialization of a Profile object.
-// Return Value:
-// - The index for the matching Profile, iff it exists. Otherwise, nullopt.
-std::optional<uint32_t> CascadiaSettings::_FindMatchingProfileIndex(const Json::Value& profileJson)
-{
-    for (uint32_t i = 0; i < _allProfiles.Size(); ++i)
-    {
-        const auto profile{ _allProfiles.GetAt(i) };
-        const auto profileImpl = winrt::get_self<Profile>(profile);
-        if (profileImpl->ShouldBeLayered(profileJson))
+        if (std::holds_alternative<Profile>(profileOrGroup))
         {
-            return i;
+            auto& profile = std::get<Profile>(profileOrGroup);
+            if (profile.ShouldBeLayered(profileJson))
+            {
+                // HERE BE DRAGONS: Returning a pointer to a type in the vector is
+                // maybe not the _safest_ thing, but we have a mind to make Profile
+                // and ColorScheme winrt types in the future, so this will be safer
+                // then.
+                return profile;
+            }
+        }
+        else if (std::holds_alternative<ProfileGroup>(profileOrGroup))
+        {
+            auto& profileGroup = std::get<ProfileGroup>(profileOrGroup);
+            return profileGroup;
         }
     }
     return std::nullopt;
@@ -1042,8 +1065,14 @@ void CascadiaSettings::_ApplyDefaultsFromUserSettings()
         // Add profile.defaults as the _first_ parent to the child
         childImpl->InsertParent(0, _userDefaultProfileSettings);
 
-        // replace parent in _profiles with child
-        _allProfiles.SetAt(profileIndex, *childImpl);
+        std::vector<Profile> profiles{};
+        ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
+
+        for (auto& profile : profiles)
+        {
+            auto profileImpl = winrt::get_self<Profile>(profile);
+            profileImpl->LayerJson(_userDefaultProfileSettings);
+        }
     }
 }
 
