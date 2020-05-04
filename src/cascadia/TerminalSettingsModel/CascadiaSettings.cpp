@@ -61,31 +61,23 @@ CascadiaSettings::CascadiaSettings(const bool addDynamicProfiles) :
 CascadiaSettings::CascadiaSettings(winrt::hstring json) :
     CascadiaSettings(false)
 {
-    const auto jsonString{ til::u16u8(json) };
-    _ParseJsonString(jsonString, false);
-    LayerJson(_userSettings);
-    _ValidateSettings();
-}
+    std::optional<GUID> profileGuid{};
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
 
-winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings CascadiaSettings::Copy() const
-{
-    // dynamic profile generators added by default
-    auto settings{ winrt::make_self<CascadiaSettings>() };
-    settings->_globals = _globals->Copy();
-    for (auto warning : _warnings)
+    for (const auto& profile : profiles)
     {
-        settings->_warnings.Append(warning);
+        if (profileName == profile.GetName())
+        {
+            try
+            {
+                profileGuid = profile.GetGuid();
+            }
+            CATCH_LOG();
+
+            break;
+        }
     }
-    settings->_loadError = _loadError;
-    settings->_deserializationErrorMessage = _deserializationErrorMessage;
-    settings->_userSettingsString = _userSettingsString;
-    settings->_userSettings = _userSettings;
-    settings->_defaultSettings = _defaultSettings;
-
-    _CopyProfileInheritanceTree(settings);
-
-    return *settings;
-}
 
 // Method Description:
 // - Copies the inheritance tree for profiles and hooks them up to a clone CascadiaSettings
@@ -141,21 +133,9 @@ void CascadiaSettings::_CopyProfileInheritanceTree(winrt::com_ptr<CascadiaSettin
 // Return Value:
 // - a non-ownership pointer to the profile matching the given guid, or nullptr
 //      if there is no match.
-winrt::Microsoft::Terminal::Settings::Model::Profile CascadiaSettings::FindProfile(winrt::guid profileGuid) const noexcept
+const std::optional<Profile> CascadiaSettings::FindProfile(GUID profileGuid) const noexcept
 {
-    const winrt::guid guid{ profileGuid };
-    for (const auto& profile : _allProfiles)
-    {
-        try
-        {
-            if (profile.Guid() == guid)
-            {
-                return profile;
-            }
-        }
-        CATCH_LOG();
-    }
-    return nullptr;
+    return ProfileGroup::FindProfile(_profilesAndGroups, profileGuid);
 }
 
 // Method Description:
@@ -180,6 +160,11 @@ IObservableVector<winrt::Microsoft::Terminal::Settings::Model::Profile> Cascadia
     return _activeProfiles;
 }
 
+std::basic_string_view<std::variant<Profile, ProfileGroup>> CascadiaSettings::GetProfilesAndGroups() const noexcept
+{
+    return ProfileGroup::GetProfilesAndGroups(_profilesAndGroups);
+}
+
 // Method Description:
 // - Returns the globally configured keybindings
 // Arguments:
@@ -200,6 +185,11 @@ winrt::Microsoft::Terminal::Settings::Model::KeyMapping CascadiaSettings::KeyMap
 winrt::Microsoft::Terminal::Settings::Model::GlobalAppSettings CascadiaSettings::GlobalSettings() const
 {
     return *_globals;
+}
+
+void CascadiaSettings::ExtractProfiles(std::vector<Profile>& profiles)
+{
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
 }
 
 // Method Description:
@@ -321,7 +311,9 @@ void CascadiaSettings::_ValidateSettings()
 //   profiles at all, we'll throw an error if there aren't any profiles.
 void CascadiaSettings::_ValidateProfilesExist()
 {
-    const bool hasProfiles = _allProfiles.Size() > 0;
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
+    const bool hasProfiles = !profiles.empty();
     if (!hasProfiles)
     {
         // Throw an exception. This is an invalid state, and we want the app to
@@ -335,12 +327,14 @@ void CascadiaSettings::_ValidateProfilesExist()
 }
 
 // Method Description:
-// - Resolves the "defaultProfile", which can be a profile name, to a GUID
-//   and stores it back to the globals.
-void CascadiaSettings::_ResolveDefaultProfile()
+// - Walks through each profile, and ensures that they had a GUID set at some
+//   point. If the profile did _not_ have a GUID ever set for it, generate a
+//   temporary runtime GUID for it. This validation does not add any warnings.
+void CascadiaSettings::_ValidateProfilesHaveGuid()
 {
-    const auto unparsedDefaultProfile{ GlobalSettings().UnparsedDefaultProfile() };
-    if (!unparsedDefaultProfile.empty())
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
+    for (auto& profile : profiles)
     {
         auto maybeParsedDefaultProfile{ _GetProfileGuidByName(unparsedDefaultProfile) };
         auto defaultProfileGuid{ til::coalesce_value(maybeParsedDefaultProfile, winrt::guid{}) };
@@ -360,7 +354,10 @@ void CascadiaSettings::_ValidateDefaultProfileExists()
     const winrt::guid defaultProfileGuid{ GlobalSettings().DefaultProfile() };
     const bool nullDefaultProfile = defaultProfileGuid == winrt::guid{};
     bool defaultProfileNotInProfiles = true;
-    for (const auto& profile : _allProfiles)
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
+
+    for (const auto& profile : profiles)
     {
         if (profile.Guid() == defaultProfileGuid)
         {
@@ -376,7 +373,7 @@ void CascadiaSettings::_ValidateDefaultProfileExists()
 
         // _temporarily_ set the default profile to the first profile. Because
         // we're adding a warning, this settings change won't be re-serialized.
-        GlobalSettings().DefaultProfile(_allProfiles.GetAt(0).Guid());
+        GlobalSettings().SetDefaultProfile(profiles[0].GetGuid());
     }
 }
 
@@ -388,29 +385,9 @@ void CascadiaSettings::_ValidateDefaultProfileExists()
 //   we find any such duplicate.
 void CascadiaSettings::_ValidateNoDuplicateProfiles()
 {
-    bool foundDupe = false;
+    std::set<GUID> uniqueGuids;
 
-    std::vector<uint32_t> indicesToDelete;
-
-    std::set<winrt::guid> uniqueGuids;
-
-    // Try collecting all the unique guids. If we ever encounter a guid that's
-    // already in the set, then we need to delete that profile.
-    for (uint32_t i = 0; i < _allProfiles.Size(); i++)
-    {
-        if (!uniqueGuids.insert(_allProfiles.GetAt(i).Guid()).second)
-        {
-            foundDupe = true;
-            indicesToDelete.push_back(i);
-        }
-    }
-
-    // Remove all the duplicates we've marked
-    // Walk backwards, so we don't accidentally shift any of the elements
-    for (auto iter = indicesToDelete.rbegin(); iter != indicesToDelete.rend(); iter++)
-    {
-        _allProfiles.RemoveAt(*iter);
-    }
+    bool foundDupe = ProfileGroup::RemoveDuplicateProfiles(_profilesAndGroups, uniqueGuids);
 
     if (foundDupe)
     {
@@ -429,18 +406,27 @@ void CascadiaSettings::_ValidateNoDuplicateProfiles()
 // - <none>
 void CascadiaSettings::_ReorderProfilesToMatchUserSettingsOrder()
 {
-    std::set<winrt::guid> uniqueGuids;
-    std::deque<winrt::guid> guidOrder;
+    std::set<GUID> uniqueGuids;
+    std::deque<GUID> guidOrder;
+    auto nullGuid = GUID{ 0 };
 
     auto collectGuids = [&](const auto& json) {
         for (auto profileJson : _GetProfilesJsonObject(json))
         {
             if (profileJson.isObject())
             {
-                auto guid = implementation::Profile::GetGuidOrGenerateForJson(profileJson);
-                if (uniqueGuids.insert(guid).second)
+                auto profilesList = _GetProfileGroupProfilesList(profileJson);
+                if (profilesList != nullptr)
                 {
-                    guidOrder.push_back(guid);
+                    guidOrder.push_back(nullGuid);
+                }
+                else
+                {
+                    auto guid = Profile::GetGuidOrGenerateForJson(profileJson);
+                    if (uniqueGuids.insert(guid).second)
+                    {
+                        guidOrder.push_back(guid);
+                    }
                 }
             }
         }
@@ -460,15 +446,17 @@ void CascadiaSettings::_ReorderProfilesToMatchUserSettingsOrder()
     for (uint32_t gIndex = 0; gIndex < guidOrder.size(); gIndex++)
     {
         const auto guid = guidOrder.at(gIndex);
-        for (uint32_t pIndex = gIndex; pIndex < _allProfiles.Size(); pIndex++)
+        for (size_t pIndex = gIndex; pIndex < _profilesAndGroups.size(); pIndex++)
         {
-            auto profileGuid = _allProfiles.GetAt(pIndex).Guid();
-            if (equals(profileGuid, guid))
+            if (std::holds_alternative<Profile>(_profilesAndGroups.at(pIndex)))
             {
-                auto prof1 = _allProfiles.GetAt(pIndex);
-                _allProfiles.SetAt(pIndex, _allProfiles.GetAt(gIndex));
-                _allProfiles.SetAt(gIndex, prof1);
-                break;
+                auto profile = std::get<Profile>(_profilesAndGroups.at(pIndex));
+                auto profileGuid = profile.GetGuid();
+                if (equals(profileGuid, guid))
+                {
+                    std::iter_swap(_profilesAndGroups.begin() + pIndex, _profilesAndGroups.begin() + gIndex);
+                    break;
+                }
             }
         }
     }
@@ -484,18 +472,13 @@ void CascadiaSettings::_ReorderProfilesToMatchUserSettingsOrder()
 // - <none>
 void CascadiaSettings::_UpdateActiveProfiles()
 {
-    _activeProfiles.Clear();
-    for (auto const& profile : _allProfiles)
-    {
-        if (!profile.Hidden())
-        {
-            _activeProfiles.Append(profile);
-        }
-    }
+    ProfileGroup::RemoveHiddenProfiles(_profilesAndGroups);
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
 
     // Ensure that we still have some profiles here. If we don't, then throw an
     // exception, so the app can use the defaults.
-    const bool hasProfiles = _activeProfiles.Size() > 0;
+    const bool hasProfiles = !profiles.empty();
     if (!hasProfiles)
     {
         // Throw an exception. This is an invalid state, and we want the app to
@@ -517,14 +500,21 @@ void CascadiaSettings::_UpdateActiveProfiles()
 void CascadiaSettings::_ValidateAllSchemesExist()
 {
     bool foundInvalidScheme = false;
-    for (auto profile : _allProfiles)
+
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
+
+    for (auto& profile : profiles)
     {
-        const auto schemeName = profile.ColorSchemeName();
-        if (!_globals->ColorSchemes().HasKey(schemeName))
+        auto schemeName = profile.GetSchemeName();
+        if (schemeName.has_value())
         {
-            // Clear the user set color scheme. We'll just fallback instead.
-            profile.ClearColorSchemeName();
-            foundInvalidScheme = true;
+            const auto found = _globals.GetColorSchemes().find(schemeName.value());
+            if (found == _globals.GetColorSchemes().end())
+            {
+                profile.SetColorScheme({ L"Campbell" });
+                foundInvalidScheme = true;
+            }
         }
     }
 
@@ -550,7 +540,10 @@ void CascadiaSettings::_ValidateMediaResources()
     bool invalidBackground{ false };
     bool invalidIcon{ false };
 
-    for (auto profile : _allProfiles)
+    std::vector<Profile> profiles{};
+    ProfileGroup::ExtractProfiles(_profilesAndGroups, profiles);
+
+    for (auto& profile : profiles)
     {
         if (!profile.BackgroundImagePath().empty())
         {
@@ -601,6 +594,27 @@ void CascadiaSettings::_ValidateMediaResources()
 }
 
 // Method Description:
+// - Create a TerminalSettings object for the profile with a GUID matching the
+//   provided GUID. If no profile matches this GUID, then this method will
+//   throw.
+// Arguments:
+// - profileGuid: The GUID of a profile to use to create a settings object for.
+// Return Value:
+// - the GUID of the created profile, and a fully initialized TerminalSettings object
+TerminalSettings CascadiaSettings::BuildSettings(GUID profileGuid) const
+{
+    const auto profile = FindProfile(profileGuid);
+    //TODO: THROW_HR_IF_NULLOPT(E_INVALIDARG, profile);
+
+    TerminalSettings result = profile.value().CreateTerminalSettings(_globals.GetColorSchemes());
+
+    // Place our appropriate global settings into the Terminal Settings
+    _globals.ApplyToSettings(result);
+
+    return result;
+}
+
+// Method Description:
 // - Helper to get the GUID of a profile, given an optional index and a possible
 //   "profile" value to override that.
 // - First, we'll try looking up the profile for the given index. This will
@@ -618,46 +632,36 @@ void CascadiaSettings::_ValidateMediaResources()
 // - the GUID of the profile corresponding to this combination of index and NewTerminalArgs
 winrt::guid CascadiaSettings::GetProfileForArgs(const Model::NewTerminalArgs& newTerminalArgs) const
 {
-    std::optional<winrt::guid> profileByIndex, profileByName;
-    if (newTerminalArgs)
-    {
-        if (newTerminalArgs.ProfileIndex() != nullptr)
-        {
-            profileByIndex = _GetProfileGuidByIndex(newTerminalArgs.ProfileIndex().Value());
-        }
+    GUID profileGuid = _globals.GetDefaultProfile();
 
         profileByName = _GetProfileGuidByName(newTerminalArgs.Profile());
     }
 
-    return til::coalesce_value(profileByName, profileByIndex, _globals->DefaultProfile());
-}
-
-// Method Description:
-// - Helper to get the GUID of a profile given a name that could be a guid or an actual name.
-// Arguments:
-// - name: a guid string _or_ the name of a profile
-// Return Value:
-// - the GUID of the profile corresponding to this name
-std::optional<winrt::guid> CascadiaSettings::_GetProfileGuidByName(const winrt::hstring name) const
-try
-{
-    // First, try and parse the "name" as a GUID. If it's a
-    // GUID, and the GUID of one of our profiles, then use that as the
-    // profile GUID instead. If it's not, then try looking it up as a
-    // name of a profile. If it's still not that, then just ignore it.
-    if (!name.empty())
-    {
-        // Do a quick heuristic check - is the profile 38 chars long (the
-        // length of a GUID string), and does it start with '{'? Because if
-        // it doesn't, it's _definitely_ not a GUID.
-        if (name.size() == 38 && name[0] == L'{')
+        // First, try and parse the "profile" argument as a GUID. If it's a
+        // GUID, and the GUID of one of our profiles, then use that as the
+        // profile GUID instead. If it's not, then try looking it up as a
+        // name of a profile. If it's still not that, then just ignore it.
+        if (!profileString.empty())
         {
-            const auto newGUID{ Utils::GuidFromString(static_cast<std::wstring>(name)) };
-            if (FindProfile(newGUID))
+            bool wasGuid = false;
+
+            // Do a quick heuristic check - is the profile 38 chars long (the
+            // length of a GUID string), and does it start with '{'? Because if
+            // it doesn't, it's _definitely_ not a GUID.
+            if (profileString.size() == 38 && profileString[0] == L'{')
             {
-                return newGUID;
+                try
+                {
+                    const auto newGUID = Utils::GuidFromString(profileString.c_str());
+                    const auto profile = FindProfile(newGUID);
+                    if (profile.has_value())
+                    {
+                        profileGuid = newGUID;
+                        wasGuid = true;
+                    }
+                }
+                CATCH_LOG();
             }
-        }
 
         // Here, we were unable to use the profile string as a GUID to
         // lookup a profile. Instead, try using the string to look the
@@ -676,32 +680,6 @@ try
 catch (...)
 {
     LOG_CAUGHT_EXCEPTION();
-    return std::nullopt;
-}
-
-// Method Description:
-// - Helper to find the profile GUID for a the profile at the given index in the
-//   list of profiles. If no index is provided, this instead returns the default
-//   profile's guid. This is used by the NewTabProfile<N> ShortcutActions to
-//   create a tab for the Nth profile in the list of profiles.
-// Arguments:
-// - index: if provided, the index in the list of profiles to get the GUID for.
-//   If omitted, instead return the default profile's GUID
-// Return Value:
-// - the Nth profile's GUID, or the default profile's GUID
-std::optional<winrt::guid> CascadiaSettings::_GetProfileGuidByIndex(std::optional<int> index) const
-{
-    if (index)
-    {
-        const auto realIndex{ index.value() };
-        // If we don't have that many profiles, then do nothing.
-        if (realIndex >= 0 &&
-            realIndex < gsl::narrow_cast<decltype(realIndex)>(_activeProfiles.Size()))
-        {
-            const auto& selectedProfile = _activeProfiles.GetAt(realIndex);
-            return selectedProfile.Guid();
-        }
-    }
     return std::nullopt;
 }
 
