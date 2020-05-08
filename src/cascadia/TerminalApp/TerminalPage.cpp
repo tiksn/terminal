@@ -354,6 +354,101 @@ namespace winrt::TerminalApp::implementation
         }
     }
 
+    void TerminalPage::_AddProfilesAndGroupsToMenu(const std::basic_string_view<std::variant<::TerminalApp::Profile, ::TerminalApp::ProfileGroup>>& profilesAndGroups, winrt::TerminalApp::AppKeyBindings* keyBindings, Windows::Foundation::Collections::IVector<Windows::UI::Xaml::Controls::MenuFlyoutItemBase>* menuFlyoutItems, GUID defaultProfileGuid)
+    {
+        // the number of profiles should not change in the loop for this to work
+        auto const profileCount = gsl::narrow_cast<int>(profilesAndGroups.size());
+        for (int profileIndex = 0; profileIndex < profileCount; profileIndex++)
+        {
+            const auto& profileOrGroup = profilesAndGroups[profileIndex];
+            if (std::holds_alternative<Profile>(profileOrGroup))
+            {
+                const auto profile = std::get<Profile>(profileOrGroup);
+
+                auto profileMenuItem = WUX::Controls::MenuFlyoutItem{};
+
+                // add the keyboard shortcuts for the first 9 profiles
+                if (profileIndex < 9 && keyBindings != nullptr)
+                {
+                    // Look for a keychord that is bound to the equivalent
+                    // NewTab(ProfileIndex=N) action
+                    auto actionAndArgs = winrt::make_self<winrt::TerminalApp::implementation::ActionAndArgs>();
+                    actionAndArgs->Action(ShortcutAction::NewTab);
+                    auto newTabArgs = winrt::make_self<winrt::TerminalApp::implementation::NewTabArgs>();
+                    auto newTerminalArgs = winrt::make_self<winrt::TerminalApp::implementation::NewTerminalArgs>();
+                    newTerminalArgs->ProfileIndex(profileIndex);
+                    newTabArgs->TerminalArgs(*newTerminalArgs);
+                    actionAndArgs->Args(*newTabArgs);
+                    auto profileKeyChord{ keyBindings->GetKeyBindingForActionWithArgs(*actionAndArgs) };
+
+                    // make sure we find one to display
+                    if (profileKeyChord)
+                    {
+                        _SetAcceleratorForMenuItem(profileMenuItem, profileKeyChord);
+                    }
+                }
+
+                auto profileName = profile.GetName();
+                winrt::hstring hName{ profileName };
+                profileMenuItem.Text(hName);
+
+                // If there's an icon set for this profile, set it as the icon for
+                // this flyout item.
+                if (profile.HasIcon())
+                {
+                    auto iconSource = GetColoredIcon<WUX::Controls::IconSource>(profile.GetExpandedIconPath());
+
+                    WUX::Controls::IconSourceElement iconElement;
+                    iconElement.IconSource(iconSource);
+                    profileMenuItem.Icon(iconElement);
+                    Automation::AutomationProperties::SetAccessibilityView(iconElement, Automation::Peers::AccessibilityView::Raw);
+                }
+
+                if (profile.GetGuid() == defaultProfileGuid)
+                {
+                    // Contrast the default profile with others in font weight.
+                    profileMenuItem.FontWeight(FontWeights::Bold());
+                }
+
+                profileMenuItem.Click([profile, weakThis{ get_weak() }](auto&&, auto&&) {
+                    if (auto page{ weakThis.get() })
+                    {
+                        auto newTerminalArgs = winrt::make_self<winrt::TerminalApp::implementation::NewTerminalArgs>();
+                        auto profileGuid = winrt::to_hstring(profile.GetGuid());
+                        newTerminalArgs->Profile(profileGuid);
+                        //TODO: Remove from IDL: newTerminalArgs->ProfileIndex(profileIndex);
+                        page->_OpenNewTab(*newTerminalArgs);
+                    }
+                });
+                menuFlyoutItems->Append(profileMenuItem);
+            }
+
+            else if (std::holds_alternative<ProfileGroup>(profileOrGroup))
+            {
+                auto profileGroup = std::get<ProfileGroup>(profileOrGroup);
+                auto profileGroupMenuFlyoutSubItem = WUX::Controls::MenuFlyoutSubItem{};
+
+                auto profileGroupName = profileGroup.GetName();
+                winrt::hstring hName{ profileGroupName };
+                profileGroupMenuFlyoutSubItem.Text(hName);
+
+                if (profileGroup.HasIcon())
+                {
+                    auto iconSource = GetColoredIcon<WUX::Controls::IconSource>(profileGroup.GetExpandedIconPath());
+
+                    WUX::Controls::IconSourceElement iconElement;
+                    iconElement.IconSource(iconSource);
+                    profileGroupMenuFlyoutSubItem.Icon(iconElement);
+                    Automation::AutomationProperties::SetAccessibilityView(iconElement, Automation::Peers::AccessibilityView::Raw);
+                }
+
+                menuFlyoutItems->Append(profileGroupMenuFlyoutSubItem);
+
+                _AddProfilesAndGroupsToMenu(profileGroup.GetProfilesAndGroups(), nullptr, &profileGroupMenuFlyoutSubItem.Items(), defaultProfileGuid);
+            }
+        }
+    }
+
     // Method Description:
     // - Process all the startup actions in the provided list of startup
     //   actions. We'll do this all at once here.
@@ -538,96 +633,9 @@ namespace winrt::TerminalApp::implementation
         auto newTabFlyout = WUX::Controls::MenuFlyout{};
         auto keyBindings = _settings.KeyMap();
 
-        const auto defaultProfileGuid = _settings.GlobalSettings().DefaultProfile();
-        // the number of profiles should not change in the loop for this to work
-        auto const profileCount = gsl::narrow_cast<int>(_settings.ActiveProfiles().Size());
-        for (int profileIndex = 0; profileIndex < profileCount; profileIndex++)
-        {
-            const auto profile = _settings.ActiveProfiles().GetAt(profileIndex);
-            auto profileMenuItem = WUX::Controls::MenuFlyoutItem{};
-
-            // Add the keyboard shortcuts based on the number of profiles defined
-            // Look for a keychord that is bound to the equivalent
-            // NewTab(ProfileIndex=N) action
-            NewTerminalArgs newTerminalArgs{ profileIndex };
-            NewTabArgs newTabArgs{ newTerminalArgs };
-            ActionAndArgs actionAndArgs{ ShortcutAction::NewTab, newTabArgs };
-            auto profileKeyChord{ keyBindings.GetKeyBindingForActionWithArgs(actionAndArgs) };
-
-            // make sure we find one to display
-            if (profileKeyChord)
-            {
-                _SetAcceleratorForMenuItem(profileMenuItem, profileKeyChord);
-            }
-
-            auto profileName = profile.Name();
-            profileMenuItem.Text(profileName);
-
-            // If there's an icon set for this profile, set it as the icon for
-            // this flyout item.
-            if (!profile.Icon().empty())
-            {
-                const auto iconSource{ IconPathConverter().IconSourceWUX(profile.Icon()) };
-
-                WUX::Controls::IconSourceElement iconElement;
-                iconElement.IconSource(iconSource);
-                profileMenuItem.Icon(iconElement);
-                Automation::AutomationProperties::SetAccessibilityView(iconElement, Automation::Peers::AccessibilityView::Raw);
-            }
-
-            if (profile.Guid() == defaultProfileGuid)
-            {
-                // Contrast the default profile with others in font weight.
-                profileMenuItem.FontWeight(FontWeights::Bold());
-            }
-
-            auto newTabRun = WUX::Documents::Run();
-            newTabRun.Text(RS_(L"NewTabRun/Text"));
-            auto newPaneRun = WUX::Documents::Run();
-            newPaneRun.Text(RS_(L"NewPaneRun/Text"));
-            newPaneRun.FontStyle(FontStyle::Italic);
-
-            auto textBlock = WUX::Controls::TextBlock{};
-            textBlock.Inlines().Append(newTabRun);
-            textBlock.Inlines().Append(WUX::Documents::LineBreak{});
-            textBlock.Inlines().Append(newPaneRun);
-
-            auto toolTip = WUX::Controls::ToolTip{};
-            toolTip.Content(textBlock);
-            WUX::Controls::ToolTipService::SetToolTip(profileMenuItem, toolTip);
-
-            profileMenuItem.Click([profileIndex, weakThis{ get_weak() }](auto&&, auto&&) {
-                if (auto page{ weakThis.get() })
-                {
-                    NewTerminalArgs newTerminalArgs{ profileIndex };
-
-                    // if alt is pressed, open a pane
-                    const CoreWindow window = CoreWindow::GetForCurrentThread();
-                    const auto rAltState = window.GetKeyState(VirtualKey::RightMenu);
-                    const auto lAltState = window.GetKeyState(VirtualKey::LeftMenu);
-                    const bool altPressed = WI_IsFlagSet(lAltState, CoreVirtualKeyStates::Down) ||
-                                            WI_IsFlagSet(rAltState, CoreVirtualKeyStates::Down);
-
-                    // Check for DebugTap
-                    bool debugTap = page->_settings.GlobalSettings().DebugFeaturesEnabled() &&
-                                    WI_IsFlagSet(lAltState, CoreVirtualKeyStates::Down) &&
-                                    WI_IsFlagSet(rAltState, CoreVirtualKeyStates::Down);
-
-                    if (altPressed && !debugTap)
-                    {
-                        page->_SplitPane(SplitState::Automatic,
-                                         SplitType::Manual,
-                                         0.5f,
-                                         newTerminalArgs);
-                    }
-                    else
-                    {
-                        page->_OpenNewTab(newTerminalArgs);
-                    }
-                }
-            });
-            newTabFlyout.Items().Append(profileMenuItem);
-        }
+        const GUID defaultProfileGuid = _settings->GlobalSettings().GetDefaultProfile();
+        auto profilesAndGroups = _settings->GetProfilesAndGroups();
+        _AddProfilesAndGroupsToMenu(profilesAndGroups, &_settings->GetKeybindings(), &newTabFlyout.Items(), defaultProfileGuid);
 
         // add menu separator
         auto separatorItem = WUX::Controls::MenuFlyoutSeparator{};
@@ -903,7 +911,7 @@ namespace winrt::TerminalApp::implementation
     TerminalConnection::ITerminalConnection TerminalPage::_CreateConnectionFromSettings(GUID profileGuid,
                                                                                         TerminalApp::TerminalSettings settings)
     {
-        const auto profile = _settings.FindProfile(profileGuid);
+        const auto profile = _settings->FindProfile(profileGuid);
 
         TerminalConnection::ITerminalConnection connection{ nullptr };
 
@@ -1187,10 +1195,10 @@ namespace winrt::TerminalApp::implementation
         if (lastFocusedProfileOpt.has_value())
         {
             const auto lastFocusedProfile = lastFocusedProfileOpt.value();
-            const auto matchingProfile = _settings.FindProfile(lastFocusedProfile);
-            if (matchingProfile)
+            const auto matchingProfile = _settings->FindProfile(lastFocusedProfile);
+            if (matchingProfile.has_value())
             {
-                tab.UpdateIcon(matchingProfile.Icon());
+                tab.UpdateIcon(matchingProfile.value().GetExpandedIconPath());
             }
             else
             {
@@ -2510,8 +2518,10 @@ namespace winrt::TerminalApp::implementation
         _HookupKeyBindings(_settings.KeyMap());
 
         // Refresh UI elements
-        auto profiles = _settings.ActiveProfiles();
-        for (const auto& profile : profiles)
+        std::vector<Profile> profiles{};
+        _settings->ExtractProfiles(profiles);
+
+        for (auto& profile : profiles)
         {
             const auto profileGuid = profile.Guid();
 
