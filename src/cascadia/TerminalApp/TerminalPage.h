@@ -156,6 +156,7 @@ namespace winrt::TerminalApp::implementation
         winrt::Microsoft::Terminal::TerminalConnection::ITerminalConnection _CreateConnectionFromSettings(GUID profileGuid, TerminalApp::TerminalSettings settings);
 
         bool _displayingCloseDialog{ false };
+        void _AddProfilesAndGroupsToMenu(const std::basic_string_view<std::variant<::TerminalApp::Profile, ::TerminalApp::ProfileGroup>>& profilesAndGroups, winrt::TerminalApp::AppKeyBindings* keyBindings, Windows::Foundation::Collections::IVector<Windows::UI::Xaml::Controls::MenuFlyoutItemBase>* menuFlyoutItems, GUID defaultProfileGuid);
         void _SettingsButtonOnClick(const IInspectable& sender, const Windows::UI::Xaml::RoutedEventArgs& eventArgs);
         void _FeedbackButtonOnClick(const IInspectable& sender, const Windows::UI::Xaml::RoutedEventArgs& eventArgs);
         void _AboutButtonOnClick(const IInspectable& sender, const Windows::UI::Xaml::RoutedEventArgs& eventArgs);
