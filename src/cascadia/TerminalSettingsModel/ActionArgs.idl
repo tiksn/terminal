@@ -88,9 +88,6 @@ namespace Microsoft.Terminal.Settings.Model
         Windows.Foundation.IReference<Windows.UI.Color> TabColor;
         String Profile; // Either a GUID or a profile's name if the GUID isn't a match
         // ProfileIndex can be null (for "use the default"), so this needs to be
-        // a IReference, so it's nullable
-        Windows.Foundation.IReference<Int32> ProfileIndex { get; };
-
         Boolean Equals(NewTerminalArgs other);
         String GenerateName();
         String ToCommandline();
