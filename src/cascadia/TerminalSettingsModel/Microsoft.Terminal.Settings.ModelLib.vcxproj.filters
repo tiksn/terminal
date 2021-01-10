@@ -32,6 +32,7 @@
       <Filter>json</Filter>
     </ClCompile>
     <ClCompile Include="init.cpp" />
+    <ClCompile Include="ProfileGroup.cpp" />
     <ClCompile Include="IconPathConverter.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -62,6 +63,7 @@
     <ClInclude Include="JsonUtils.h">
       <Filter>json</Filter>
     </ClInclude>
+    <ClInclude Include="ProfileGroup.h" />
     <ClInclude Include="IInheritable.h" />
     <ClInclude Include="IconPathConverter.h" />
   </ItemGroup>
